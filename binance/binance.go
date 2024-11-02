@@ -31,6 +31,7 @@ func GetBinExchangeInfo() []string {
 	}
 	return symbolSlice
 }
+
 func GetBifExchangeInfo() []string {
 	endPoint := bif + "/fapi/v1/exchangeInfo"
 	queryString := ""
@@ -47,5 +48,4 @@ func GetBifExchangeInfo() []string {
 		}
 	}
 	return symbolSlice
-
 }

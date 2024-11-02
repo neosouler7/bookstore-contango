@@ -21,6 +21,8 @@ var (
 const (
 	bin string = "stream.binance.com:9443"
 	bif string = "fstream.binance.com"
+	byb string = "stream.bybit.com"
+	byf string = "stream.bybit.com"
 )
 
 type hostPath struct {
@@ -80,6 +82,12 @@ func (h *hostPath) getHostPath(exchange string) {
 	case "bif":
 		h.host = bif
 		h.path = "/stream"
+	case "byb":
+		h.host = byb
+		h.path = "/v5/public/spot"
+	case "byf":
+		h.host = byf
+		h.path = "/v5/public/linear"
 	}
 }
 
