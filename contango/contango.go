@@ -11,14 +11,16 @@ import (
 	"github.com/neosouler7/bookstore-contango/binance"
 	"github.com/neosouler7/bookstore-contango/bybit"
 	"github.com/neosouler7/bookstore-contango/commons"
+	"github.com/neosouler7/bookstore-contango/redismanager"
 	"github.com/neosouler7/bookstore-contango/tgmanager"
 	"github.com/neosouler7/bookstore-contango/websocketmanager"
 )
 
 var (
-	syncMap      sync.Map
-	bybOrderbook sync.Map
-	byfOrderbook sync.Map
+	subscribeDone = make(chan struct{}) // subscribe 완료 신호 채널
+	bybOrderbook  sync.Map
+	byfOrderbook  sync.Map
+	syncMap       sync.Map
 )
 
 type OrderbookEntry struct {
@@ -31,114 +33,8 @@ type Orderbook struct {
 	Asks []OrderbookEntry // 오름차순
 }
 
-func pong() {
-	for {
-		for _, exchange := range []string{"bin", "bif"} {
-			websocketmanager.Pong(exchange)
-		}
-		for _, exchange := range []string{"byb", "byf"} {
-			websocketmanager.SendMsg(exchange, "{\"op\": \"ping\"")
-		}
-		log.Println("ping")
-		time.Sleep(time.Second * 5)
-	}
-}
-
-func subscribe(pairs []string) {
-	time.Sleep(time.Second * 1)
-	for _, exchange := range []string{"bin", "bif"} {
-		var streamSlice []string
-		for _, pair := range pairs {
-			var pairInfo = strings.Split(pair, ":")
-			market, symbol := strings.ToLower(pairInfo[0]), strings.ToLower(pairInfo[1])
-			streamSlice = append(streamSlice, fmt.Sprintf("\"%s%s@depth20\"", symbol, market))
-		}
-		streams := strings.Join(streamSlice, ",")
-
-		msg := fmt.Sprintf("{\"method\": \"SUBSCRIBE\",\"params\": [%s],\"id\": %d}", streams, time.Now().UnixNano()/100000)
-		websocketmanager.SendMsg(exchange, msg)
-		log.Printf(websocketmanager.SubscribeMsg, exchange)
-	}
-
-	for _, exchange := range []string{"byb", "byf"} {
-		var streamSlice []string
-		for _, pair := range pairs {
-			var pairInfo = strings.Split(pair, ":")
-			market, symbol := strings.ToUpper(pairInfo[0]), strings.ToUpper(pairInfo[1])
-			streamSlice = append(streamSlice, fmt.Sprintf("\"orderbook.50.%s%s\"", symbol, market))
-		}
-
-		for i := 0; i < len(streamSlice); i += 5 {
-			end := i + 5
-			if end > len(streamSlice) {
-				end = len(streamSlice)
-			}
-			streams := strings.Join(streamSlice[i:end], ",")
-
-			msg := fmt.Sprintf("{\"op\": \"subscribe\",\"args\": [%s]}", streams)
-			//fmt.Println(msg)
-
-			websocketmanager.SendMsg(exchange, msg)
-			fmt.Printf(websocketmanager.SubscribeMsg, exchange)
-		}
-	}
-}
-
-func receiveBin(exchange string) {
-	for {
-		_, msgBytes, err := websocketmanager.Conn(exchange).ReadMessage()
-		tgmanager.HandleErr(exchange, err)
-
-		if strings.Contains(string(msgBytes), "result") {
-			fmt.Printf(websocketmanager.FilteredMsg, exchange, string(msgBytes))
-		} else {
-			var rJson interface{}
-			commons.Bytes2Json(msgBytes, &rJson)
-
-			data := rJson.(map[string]interface{})["data"]
-			askR, bidR := data.(map[string]interface{})["asks"], data.(map[string]interface{})["bids"]
-			askPrice, bidPrice := askR.([]interface{})[1].([]interface{})[0], bidR.([]interface{})[1].([]interface{})[0] // 2번째 호가의 가격
-			ts, pair := strconv.FormatInt(time.Now().UnixNano()/1000000, 10), strings.Split(rJson.(map[string]interface{})["stream"].(string), "@")[0]
-			market, symbol := "usdt", pair[:len(pair)-4]
-
-			//fmt.Printf("%s|%s|%s|%s|%s|%s\n", exchange, market, symbol, askPrice, bidPrice, ts)
-
-			key := fmt.Sprintf("%s:%s:%s", exchange, market, symbol)
-			value := fmt.Sprintf("%s:%s:%s", askPrice, bidPrice, ts)
-			syncMap.Store(key, value)
-		}
-
-	}
-}
-
-func receiveBif(exchange string) {
-	for {
-		_, msgBytes, err := websocketmanager.Conn(exchange).ReadMessage()
-		tgmanager.HandleErr(exchange, err)
-
-		if strings.Contains(string(msgBytes), "result") {
-			fmt.Printf(websocketmanager.FilteredMsg, exchange, string(msgBytes))
-		} else {
-			var rJson interface{}
-			commons.Bytes2Json(msgBytes, &rJson)
-
-			data := rJson.(map[string]interface{})["data"]
-			askR, bidR := data.(map[string]interface{})["a"], data.(map[string]interface{})["b"]
-			askPrice, bidPrice := askR.([]interface{})[1].([]interface{})[0], bidR.([]interface{})[1].([]interface{})[0] // 2번째 호가의 가격
-			ts, pair := strconv.FormatInt(int64(data.(map[string]interface{})["T"].(float64)), 10), data.(map[string]interface{})["s"]
-			market, symbol := "usdt", strings.ToLower(pair.(string)[:len(pair.(string))-4])
-
-			//fmt.Printf("%s|%s|%s|%s|%s|%s\n", exchange, market, symbol, askPrice, bidPrice, ts)
-
-			key := fmt.Sprintf("%s:%s:%s", exchange, market, symbol)
-			value := fmt.Sprintf("%s:%s:%s", askPrice, bidPrice, ts)
-			syncMap.Store(key, value)
-		}
-
-	}
-}
-
-func UpdateOrderbook(orderbookMap *sync.Map, pair string, isSnapshot bool, bids, asks [][]string) {
+// byb, byf의 websocket 리턴값을 적정 반영하기 위한 함수
+func updateOrderbook(orderbookMap *sync.Map, pair string, isSnapshot bool, bids, asks [][]string) {
 	var currentOrderbook Orderbook
 
 	// Orderbook이 이미 존재하는지 확인
@@ -231,6 +127,7 @@ func getBestPrices(orderbookMap *sync.Map, pair string) (float64, float64) {
 	return bestBid, bestAsk
 }
 
+// Order 리스트를 반환하는 함수
 func parseOrders(rawOrders []interface{}) [][]string {
 	var orders [][]string
 	for _, rawOrder := range rawOrders {
@@ -240,6 +137,122 @@ func parseOrders(rawOrders []interface{}) [][]string {
 		orders = append(orders, []string{price, amount})
 	}
 	return orders
+}
+
+func pong() {
+	for {
+		for _, exchange := range []string{"bin", "bif"} {
+			websocketmanager.Pong(exchange)
+		}
+		for _, exchange := range []string{"byb", "byf"} {
+			websocketmanager.SendMsg(exchange, "{\"op\": \"ping\"")
+		}
+		log.Println("ping")
+		time.Sleep(time.Second * 5)
+	}
+}
+
+func subscribe(pairMap map[string][]string) {
+	time.Sleep(time.Second * 1)
+	for _, exchange := range []string{"bin", "bif"} {
+		var streamSlice []string
+		for _, pair := range pairMap[exchange] {
+			var pairInfo = strings.Split(pair, ":")
+			market, symbol := strings.ToLower(pairInfo[0]), strings.ToLower(pairInfo[1])
+			streamSlice = append(streamSlice, fmt.Sprintf("\"%s%s@depth20\"", symbol, market))
+		}
+
+		for i := 0; i < len(streamSlice); i += 200 {
+			end := i + 200
+			if end > len(streamSlice) {
+				end = len(streamSlice)
+			}
+			streams := strings.Join(streamSlice[i:end], ",")
+
+			msg := fmt.Sprintf("{\"method\": \"SUBSCRIBE\",\"params\": [%s],\"id\": %d}", streams, time.Now().UnixNano()/100000)
+			websocketmanager.SendMsg(exchange, msg)
+			log.Printf(websocketmanager.SubscribeMsg, exchange)
+
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	for _, exchange := range []string{"byb", "byf"} {
+		var streamSlice []string
+		for _, pair := range pairMap[exchange] {
+			var pairInfo = strings.Split(pair, ":")
+			market, symbol := strings.ToUpper(pairInfo[0]), strings.ToUpper(pairInfo[1])
+			streamSlice = append(streamSlice, fmt.Sprintf("\"orderbook.50.%s%s\"", symbol, market))
+		}
+
+		for i := 0; i < len(streamSlice); i += 10 {
+			end := i + 10
+			if end > len(streamSlice) {
+				end = len(streamSlice)
+			}
+			streams := strings.Join(streamSlice[i:end], ",")
+
+			msg := fmt.Sprintf("{\"op\": \"subscribe\",\"args\": [%s]}", streams)
+			websocketmanager.SendMsg(exchange, msg)
+			fmt.Printf(websocketmanager.SubscribeMsg, exchange)
+
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	close(subscribeDone) // 모든 websocket 구독 요청 완료
+}
+
+func receiveBin(exchange string) {
+	for {
+		_, msgBytes, err := websocketmanager.Conn(exchange).ReadMessage()
+		tgmanager.HandleErr(exchange, err)
+
+		if strings.Contains(string(msgBytes), "result") {
+			fmt.Printf(websocketmanager.FilteredMsg, exchange, string(msgBytes))
+		} else {
+			var rJson interface{}
+			commons.Bytes2Json(msgBytes, &rJson)
+
+			data := rJson.(map[string]interface{})["data"]
+			askR, bidR := data.(map[string]interface{})["asks"], data.(map[string]interface{})["bids"]
+			askPrice, bidPrice := askR.([]interface{})[1].([]interface{})[0], bidR.([]interface{})[1].([]interface{})[0] // 2번째 호가의 가격
+			ts, pair := strconv.FormatInt(time.Now().UnixNano()/1000000, 10), strings.Split(rJson.(map[string]interface{})["stream"].(string), "@")[0]
+			market, symbol := "usdt", pair[:len(pair)-4]
+
+			//fmt.Printf("%s|%s|%s|%s|%s|%s\n", exchange, market, symbol, askPrice, bidPrice, ts)
+
+			key := fmt.Sprintf("%s:%s:%s", exchange, market, symbol)
+			value := fmt.Sprintf("%s:%s:%s", askPrice, bidPrice, ts)
+			syncMap.Store(key, value)
+		}
+	}
+}
+
+func receiveBif(exchange string) {
+	for {
+		_, msgBytes, err := websocketmanager.Conn(exchange).ReadMessage()
+		tgmanager.HandleErr(exchange, err)
+
+		if strings.Contains(string(msgBytes), "result") {
+			fmt.Printf(websocketmanager.FilteredMsg, exchange, string(msgBytes))
+		} else {
+			var rJson interface{}
+			commons.Bytes2Json(msgBytes, &rJson)
+
+			data := rJson.(map[string]interface{})["data"]
+			askR, bidR := data.(map[string]interface{})["a"], data.(map[string]interface{})["b"]
+			askPrice, bidPrice := askR.([]interface{})[1].([]interface{})[0], bidR.([]interface{})[1].([]interface{})[0] // 2번째 호가의 가격
+			ts, pair := strconv.FormatInt(int64(data.(map[string]interface{})["T"].(float64)), 10), data.(map[string]interface{})["s"]
+			market, symbol := "usdt", strings.ToLower(pair.(string)[:len(pair.(string))-4])
+
+			//fmt.Printf("%s|%s|%s|%s|%s|%s\n", exchange, market, symbol, askPrice, bidPrice, ts)
+
+			key := fmt.Sprintf("%s:%s:%s", exchange, market, symbol)
+			value := fmt.Sprintf("%s:%s:%s", askPrice, bidPrice, ts)
+			syncMap.Store(key, value)
+		}
+	}
 }
 
 func receiveByb(exchange string) {
@@ -259,12 +272,13 @@ func receiveByb(exchange string) {
 				bids := parseOrders(data["b"].([]interface{}))
 				asks := parseOrders(data["a"].([]interface{}))
 				isSnapshot := rJson["type"].(string) == "snapshot"
-				UpdateOrderbook(&bybOrderbook, pair, isSnapshot, bids, asks)
+				updateOrderbook(&bybOrderbook, pair, isSnapshot, bids, asks)
 
 				// 현재 ask/bid 가격 출력
 				bidPrice, askPrice := getBestPrices(&bybOrderbook, pair)
 				bidPriceStr, askPriceStr := strconv.FormatFloat(bidPrice, 'f', -1, 64), strconv.FormatFloat(askPrice, 'f', -1, 64)
 				tsStr := strconv.FormatFloat(ts, 'f', -1, 64)
+
 				//fmt.Printf("%s|%s|%s|%s|%s|%s\n", exchange, market, symbol, askPriceStr, bidPriceStr, tsStr)
 
 				key := fmt.Sprintf("%s:%s:%s", exchange, market, symbol)
@@ -292,12 +306,13 @@ func receiveByf(exchange string) {
 				bids := parseOrders(data["b"].([]interface{}))
 				asks := parseOrders(data["a"].([]interface{}))
 				isSnapshot := rJson["type"].(string) == "snapshot"
-				UpdateOrderbook(&byfOrderbook, pair, isSnapshot, bids, asks)
+				updateOrderbook(&byfOrderbook, pair, isSnapshot, bids, asks)
 
 				// 현재 ask/bid 가격 출력
 				bidPrice, askPrice := getBestPrices(&byfOrderbook, pair)
 				bidPriceStr, askPriceStr := strconv.FormatFloat(bidPrice, 'f', -1, 64), strconv.FormatFloat(askPrice, 'f', -1, 64)
 				tsStr := strconv.FormatFloat(ts, 'f', -1, 64)
+
 				//fmt.Printf("%s|%s|%s|%s|%s|%s\n", exchange, market, symbol, askPriceStr, bidPriceStr, tsStr)
 
 				key := fmt.Sprintf("%s:%s:%s", exchange, market, symbol)
@@ -308,28 +323,80 @@ func receiveByf(exchange string) {
 	}
 }
 
-func setPremium(pairs []string) {
+func calShortLongPremium(pairMap map[string][]string) {
 	for {
-		for _, pair := range pairs {
-			var pairInfo = strings.Split(pair, ":")
-			market, symbol := strings.ToLower(pairInfo[0]), strings.ToLower(pairInfo[1])
+		mutualPairs := commons.Intersect(pairMap["bif"], pairMap["byf"])
+		log.Printf("%s <-> %s %d mutual pairs\n", "bif", "byf", len(mutualPairs))
 
-			// for _, se := range []string{"bin", "byb"} {
-			// 	for _, fe := range []string{"bif", "byf"} {
-			for _, se := range []string{"bin", "byb"} {
-				for _, fe := range []string{"bif", "byf"} {
-					// TODO. 값을 못 가져옴
-					spot, ok := waitForSyncMap(fmt.Sprintf("%s:%s:%s", se, market, symbol))
+		for _, shortE := range []string{"bif", "byf"} {
+			for _, longE := range []string{"byf", "bif"} {
+				if shortE == longE {
+					continue
+				}
+				for _, pair := range mutualPairs {
+					var pairInfo = strings.Split(pair, ":")
+					market, symbol := strings.ToLower(pairInfo[0]), strings.ToLower(pairInfo[1])
+
+					shortInfo, ok := syncMap.Load(fmt.Sprintf("%s:%s:%s", shortE, market, symbol))
 					if !ok {
-						fmt.Printf("Spot data not ready for %s:%s:%s, retrying...\n", se, market, symbol)
-						time.Sleep(time.Second * 1)
+						log.Printf("RETRY SHORT %s:%s:%s\n", shortE, market, symbol)
+						time.Sleep(time.Millisecond * 100)
+						continue
+					}
+					longInfo, ok := syncMap.Load(fmt.Sprintf("%s:%s:%s", longE, market, symbol))
+					if !ok {
+						log.Printf("RETRY LONG %s:%s:%s\n", longE, market, symbol)
+						time.Sleep(time.Millisecond * 100)
 						continue
 					}
 
-					future, ok := waitForSyncMap(fmt.Sprintf("%s:%s:%s", fe, market, symbol))
+					// Premium 계산(ask:bid:ts)
+					shortPrice, longPrice, _ := strings.Split(shortInfo.(string), ":")[1], strings.Split(longInfo.(string), ":")[0], strings.Split(longInfo.(string), ":")[2]
+					shotPriceFloat, _ := strconv.ParseFloat(shortPrice, 64)
+					longPriceFloat, _ := strconv.ParseFloat(longPrice, 64)
+					premium := commons.RoundToDecimal((longPriceFloat-shotPriceFloat)/shotPriceFloat, 5) * 100
+
+					key := fmt.Sprintf("sl:%s:%s:%s:%s", shortE, longE, market, symbol)
+					value := fmt.Sprintf("%f", premium)
+					msg := fmt.Sprintf("%s -> %.6s (short: %.8s, long: %.8s)\n", key, value, shortPrice, longPrice)
+
+					// log.Printf("%s", msg)
+
+					if premium > 0.5 {
+						if premium < 1.0 {
+							tgmanager.SendMsg(msg)
+						}
+					}
+
+					redismanager.PreHandlePremium(key, value)
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+		}
+	}
+}
+
+func calSpotFuturePremium(pairMap map[string][]string) {
+	for {
+		for _, se := range []string{"bin", "byb"} {
+			for _, fe := range []string{"bif", "byf"} {
+				mutualPairs := commons.Intersect(pairMap[se], pairMap[fe])
+
+				for _, pair := range mutualPairs {
+					var pairInfo = strings.Split(pair, ":")
+					market, symbol := strings.ToLower(pairInfo[0]), strings.ToLower(pairInfo[1])
+
+					spot, ok := syncMap.Load(fmt.Sprintf("%s:%s:%s", se, market, symbol))
 					if !ok {
-						fmt.Printf("Future data not ready for %s:%s:%s, retrying...\n", fe, market, symbol)
-						time.Sleep(time.Second * 1)
+						log.Printf("RETRY SPOT %s:%s:%s\n", se, market, symbol)
+						time.Sleep(time.Millisecond * 100)
+						continue
+					}
+
+					future, ok := syncMap.Load(fmt.Sprintf("%s:%s:%s", fe, market, symbol))
+					if !ok {
+						log.Printf("RETRY FUTURE %s:%s:%s\n", fe, market, symbol)
+						time.Sleep(time.Millisecond * 100)
 						continue
 					}
 
@@ -339,16 +406,19 @@ func setPremium(pairs []string) {
 					futurePriceFloat, _ := strconv.ParseFloat(futurePrice, 64)
 					premium := commons.RoundToDecimal((futurePriceFloat-spotPriceFloat)/spotPriceFloat, 5) * 100
 
-					key := fmt.Sprintf("%s:%s:%s:%s", se, fe, market, symbol)
+					key := fmt.Sprintf("sf:%s:%s:%s:%s", se, fe, market, symbol)
 					value := fmt.Sprintf("%f", premium)
 					msg := fmt.Sprintf("%s -> %.6s (spot: %.8s, future: %.8s)\n", key, value, spotPrice, futurePrice)
 
-					log.Printf("%s", msg)
+					// log.Printf("%s", msg)
 
-					if premium > 0.3 {
-						tgmanager.SendMsg(msg)
+					if premium > 0.5 {
+						if premium < 1.0 {
+							tgmanager.SendMsg(msg)
+						}
 					}
-					// TODO. redis set
+
+					redismanager.PreHandlePremium(key, value)
 					time.Sleep(10 * time.Millisecond)
 				}
 			}
@@ -356,76 +426,60 @@ func setPremium(pairs []string) {
 	}
 }
 
-func waitForSyncMap(key string) (interface{}, bool) {
-	for {
-		value, ok := syncMap.Load(key)
-		if ok {
-			return value, true
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func intersect(slice1, slice2 []string) []string {
-	// 첫 번째 슬라이스 요소를 map에 저장
-	lookup := make(map[string]struct{})
-	for _, item := range slice1 {
-		lookup[item] = struct{}{}
-	}
-
-	// 공통된 요소를 저장할 결과 슬라이스
-	var result []string
-	for _, item := range slice2 {
-		if _, exists := lookup[item]; exists {
-			result = append(result, item)
-			delete(lookup, item) // 중복 방지를 위해 제거
-		}
-	}
-
-	return result
-}
-
-// 편의상 모든 거래소에 공통으로 등록된 symbol을 대상으로함. 그럼에도 충분하다!
-func getMutualPairs() []string {
-	binPairs, bifPairs := binance.GetBinExchangeInfo(), binance.GetBifExchangeInfo()
-	bybPairs, byfPairs := bybit.GetBybExchangeInfo(), bybit.GetByfExchangeInfo()
-	mutualPairs := intersect(intersect(binPairs, bifPairs), intersect(bybPairs, byfPairs))
-	log.Printf("bin: %d, bif: %d, byb: %d, byf: %d -> mut: %d\n", len(binPairs), len(bifPairs), len(bybPairs), len(byfPairs), len(mutualPairs))
-	return mutualPairs
+func getPairMap() map[string][]string {
+	pairMap := make(map[string][]string)
+	pairMap["bin"], pairMap["bif"] = binance.GetBinExchangeInfo(), binance.GetBifExchangeInfo()
+	pairMap["byb"], pairMap["byf"] = bybit.GetBybExchangeInfo(), bybit.GetByfExchangeInfo()
+	return pairMap
 }
 
 func Run() {
-	pairs := getMutualPairs()[:100]
-	// pairs := []string{"usdt:xtz", "usdt:unfi", "usdt:celr"}
 	var wg sync.WaitGroup
+	var once sync.Once
+	subscribeDone := make(chan struct{})
 
-	// pong
-	wg.Add(1)
-	go pong()
+	pairMap := getPairMap()
 
-	// subscribe websocket stream
+	// pong 함수는 무한 루프에서 별도로 실행
 	wg.Add(1)
 	go func() {
-		subscribe(pairs)
-		wg.Done()
+		defer wg.Done()
+		pong()
 	}()
 
-	// receive websocket msg
 	wg.Add(1)
-	go receiveBin("bin")
+	go func() {
+		defer wg.Done()
+		subscribe(pairMap)                       // 구독 요청
+		once.Do(func() { close(subscribeDone) }) // 구독 완료 신호
+	}()
+	<-subscribeDone // 구독 완료 신호 대기
 
+	// subscribe 완료 후 receive 함수들 실행
 	wg.Add(1)
-	go receiveBif("bif")
+	go func() {
+		defer wg.Done()
+		go receiveBin("bin")
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		go receiveBif("bif")
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		go receiveByb("byb")
+	}()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		go receiveByf("byf")
+	}()
 
-	wg.Add(1)
-	go receiveByb("byb")
-
-	wg.Add(1)
-	go receiveByf("byf")
-
-	// calculate premium
-	wg.Add(1)
-	go setPremium(pairs)
+	// 2개의 calculatePremium은 receive 함수 시작 후 바로 실행
+	go calSpotFuturePremium(pairMap)
+	go calShortLongPremium(pairMap)
 
 	wg.Wait()
 }
