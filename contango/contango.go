@@ -34,7 +34,7 @@ type Orderbook struct {
 }
 
 // byb, byf의 websocket 리턴값을 적정 반영하기 위한 함수
-func updateOrderbook(orderbookMap *sync.Map, pair string, isSnapshot bool, bids, asks [][]string) {
+func updateOrderbook(orderbookMap *sync.Map, pair string, bids, asks [][]string) {
 	var currentOrderbook Orderbook
 
 	// Orderbook이 이미 존재하는지 확인
@@ -271,8 +271,8 @@ func receiveByb(exchange string) {
 				// Orderbook Update
 				bids := parseOrders(data["b"].([]interface{}))
 				asks := parseOrders(data["a"].([]interface{}))
-				isSnapshot := rJson["type"].(string) == "snapshot"
-				updateOrderbook(&bybOrderbook, pair, isSnapshot, bids, asks)
+				// isSnapshot := rJson["type"].(string) == "snapshot"
+				updateOrderbook(&bybOrderbook, pair, bids, asks)
 
 				// 현재 ask/bid 가격 출력
 				bidPrice, askPrice := getBestPrices(&bybOrderbook, pair)
@@ -305,8 +305,8 @@ func receiveByf(exchange string) {
 				// Orderbook Update
 				bids := parseOrders(data["b"].([]interface{}))
 				asks := parseOrders(data["a"].([]interface{}))
-				isSnapshot := rJson["type"].(string) == "snapshot"
-				updateOrderbook(&byfOrderbook, pair, isSnapshot, bids, asks)
+				// isSnapshot := rJson["type"].(string) == "snapshot"
+				updateOrderbook(&byfOrderbook, pair, bids, asks)
 
 				// 현재 ask/bid 가격 출력
 				bidPrice, askPrice := getBestPrices(&byfOrderbook, pair)
